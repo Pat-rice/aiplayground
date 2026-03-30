@@ -1,0 +1,33 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go
+vendor/
+
+# Environment
+.env
+
+# Node (TypeSpec)
+node_modules/
+api/typespec/node_modules/
+
+# Generated OpenAPI specs
+api/openapi-spec/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI
+.mcp.json
