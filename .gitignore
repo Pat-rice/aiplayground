@@ -16,9 +16,6 @@ vendor/
 node_modules/
 api/typespec/node_modules/
 
-# Generated OpenAPI specs
-api/openapi-spec/
-
 # IDE
 .idea/
 .vscode/
