@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Generate code
+        run: make generate
+
+      - name: Check generated code is up to date
+        run: |
+          git diff --exit-code || (echo "Generated code is out of date. Run 'make generate' and commit." && exit 1)
+
+      - name: Build
+        run: make build
+
+      - name: Unit tests
+        run: make test-unit
+
+      - name: Integration tests (dockertest + PostgreSQL)
+        run: make test-integration
+
+  fuzz:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start services
+        run: docker compose up -d --build --wait
+
+      - name: Install schemathesis
+        run: pip install schemathesis
+
+      - name: Run schemathesis fuzz tests
+        run: schemathesis run api/openapi-spec/v2/openapi.yaml --base-url http://localhost:8080 --checks all --wait-for-schema 30
+
+      - name: Stop services
+        if: always()
+        run: docker compose down
