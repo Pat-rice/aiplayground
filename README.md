@@ -1,104 +1,246 @@
-# Pet Store API Template
+# Go API Template — Spec-First, Multi-Version
 
-A spec-first Go API template combining **TypeSpec**, **oapi-codegen**, **sqlc**, and **schemathesis**.
+A reference template for building Go HTTP APIs where the **API contract is the source of truth** and **multiple API versions are first-class citizens**.
+
+The design philosophy: write the API once in [TypeSpec](https://typespec.io), version it explicitly with the `@versioned` decorator, and let codegen produce per-version OpenAPI specs and per-version Go server stubs. Handler code, database access, and tests follow the same pattern — generated where possible, hand-written where the business logic lives.
+
+The example domain is a Pet Store with two versions (`1.0` and `2.0`), where `2.0` adds a `tags` field to `Pet` and a new `GET /pets/{petId}/tags` endpoint. The infrastructure to add a `3.0` is already in place — only the TypeSpec changes.
+
+## Why spec-first
+
+- **Single source of truth.** The API contract lives in one place (`api/typespec/`). OpenAPI YAML, Go interfaces, request/response types, validation, and docs are all derived from it.
+- **No drift between spec and implementation.** The Go server implements a generated `StrictServerInterface`; adding a new endpoint to TypeSpec causes a compile error until the handler is implemented.
+- **Versioning without forking.** `@added(Versions.v2)` and `@removed` decorators let you describe the *delta* between versions in one TypeSpec file. The compiler emits one OpenAPI document per version.
+- **Contract-level fuzzing.** Because the spec is authoritative, [schemathesis](https://schemathesis.readthedocs.io) can generate property-based tests directly from it.
 
 ## Stack
 
-| Tool | Role |
+| Layer | Tool |
 |---|---|
-| [TypeSpec](https://typespec.io) | API contract definition |
-| [oapi-codegen](https://github.com/oapi-codegen/oapi-codegen) | Go server code generation from OpenAPI |
-| [sqlc](https://sqlc.dev) | Type-safe Go code from SQL queries |
-| [PostgreSQL](https://www.postgresql.org) | Database (via Docker Compose) |
-| [schemathesis](https://schemathesis.readthedocs.io) | API fuzz testing |
+| API contract | [TypeSpec](https://typespec.io) with `@typespec/versioning` |
+| OpenAPI emission | `@typespec/openapi3` |
+| Go server codegen | [oapi-codegen](https://github.com/oapi-codegen/oapi-codegen) (strict server, `net/http`) |
+| Database codegen | [sqlc](https://sqlc.dev) (pgx/v5 driver) |
+| Database | PostgreSQL 16 |
+| Migrations | [golang-migrate](https://github.com/golang-migrate/migrate) (embedded via `embed.FS`) |
+| Integration tests | [dockertest](https://github.com/ory/dockertest) (ephemeral Postgres per run) |
+| Contract fuzzing | [schemathesis](https://schemathesis.readthedocs.io) |
+| Lint | [golangci-lint](https://golangci-lint.run) |
 
-## Pipeline
+## Architecture
 
 ```
-TypeSpec (.tsp) --> OpenAPI 3.0 (YAML) --> Go server code (net/http)
-SQL queries     --> Go database code (pgx/v5)
+                ┌──────────────────────────┐
+                │  api/typespec/*.tsp      │  Single source of truth
+                │  @versioned(Versions)    │  Versions = { v1: "1.0", v2: "2.0" }
+                └──────────────┬───────────┘
+                               │  tsp compile
+                               ▼
+        ┌──────────────────────────────────────────────┐
+        │  api/openapi-spec/1.0/openapi.yaml           │
+        │  api/openapi-spec/2.0/openapi.yaml           │  One spec per version
+        └──────────────┬─────────────────┬─────────────┘
+                       │                 │
+              oapi-codegen          schemathesis
+              (API_VERSION)          (per-version fuzz)
+                       │
+                       ▼
+        ┌──────────────────────────────────────────────┐
+        │  internal/api/gen.go                         │  Strict server interface,
+        │  - StrictServerInterface                     │  request/response types,
+        │  - request/response models                   │  embedded OpenAPI spec
+        └──────────────┬───────────────────────────────┘
+                       │  implements
+                       ▼
+        ┌──────────────────────────────────────────────┐
+        │  internal/server/server.go                   │  Hand-written handlers
+        │    └─ uses internal/db (sqlc-generated)      │
+        └──────────────────────────────────────────────┘
+
+        db/queries/*.sql ──sqlc──▶ internal/db/*.sql.go
+        db/migrations/*.sql ──embed.FS──▶ migrate runner
 ```
 
-## Quick Start
+### Multi-version mechanics
+
+Versions are declared once in `api/typespec/main.tsp`:
+
+```typespec
+@versioned(Versions)
+namespace PetStore;
+
+enum Versions {
+  v1: "1.0",
+  v2: "2.0",
+}
+```
+
+Changes are then annotated on individual fields, operations, or models:
+
+```typespec
+model Pet {
+  id: int64;
+  name: string;
+  // ...
+  @added(Versions.v2)
+  tags: string[];
+}
+
+@added(Versions.v2)
+@route("{petId}/tags")
+@get
+op listPetTags(@path petId: int64): /* ... */;
+```
+
+The TypeSpec compiler emits one OpenAPI document per declared version into `api/openapi-spec/<version>/openapi.yaml`. A positional argument on the relevant `just` recipes controls which spec is fed to `oapi-codegen` and to `schemathesis`:
 
 ```bash
-# Start PostgreSQL
-docker compose up postgres -d
-
-# Set environment
-export DATABASE_URL="postgres://postgres:postgres@localhost:5432/petstore?sslmode=disable"
-
-# Generate all code (TypeSpec + oapi-codegen + sqlc)
-make generate
-
-# Build and run
-make run
+just generate-api 2.0    # generate Go server bound to v2.0
+just fuzz         1.0    # fuzz the v1.0 contract
 ```
 
-Or run everything with Docker:
+Adding a new version is a three-step process:
+
+1. Add a value to the `Versions` enum in `main.tsp`.
+2. Annotate the additions/removals/renames with `@added` / `@removed` / `@renamedFrom`.
+3. Run `just generate` — a new `api/openapi-spec/<version>/` directory appears.
+
+## Project layout
+
+```
+api/typespec/             TypeSpec source (the contract)
+  main.tsp                  @service, @versioned, Versions enum
+  models.tsp                Pet, NewPet, UpdatePet, PetPage, Error
+  routes.tsp                Pets and Health namespaces
+  tspconfig.yaml            emits to ../openapi-spec/<version>/
+
+api/openapi-spec/         Generated OpenAPI documents (one folder per version)
+  1.0/openapi.yaml
+  2.0/openapi.yaml
+
+cmd/api/                  Application entrypoint (HTTP server, signal handling)
+internal/api/             Generated Go server interface and types (oapi-codegen)
+internal/db/              Generated type-safe queries (sqlc)
+internal/server/          Hand-written handlers implementing StrictServerInterface
+internal/config/          Env-based configuration
+internal/migrate/         Embedded migration runner (golang-migrate)
+internal/testutil/        dockertest helpers for integration tests
+
+db/migrations/            Up/down SQL migrations (embedded into the binary)
+db/queries/               SQL queries consumed by sqlc
+db/seeds/                 Optional dev seed data
+db/embed.go               //go:embed of migrations and seeds
+
+justfile                  All generation, build, test, lint, fuzz, migrate recipes
+docker-compose.yaml       Local Postgres + API container
+Dockerfile                Multi-stage build for the API binary
+oapi-codegen.yaml         oapi-codegen configuration
+sqlc.yaml                 sqlc configuration
+tools.go                  Tool dependencies pinned in go.mod
+```
+
+## Quick start
+
+```bash
+# 1. Start Postgres
+docker compose up postgres -d
+
+# 2. Configure (justfile auto-loads .env via `set dotenv-load`)
+cp .env.example .env
+
+# 3. Generate everything (TypeSpec → OpenAPI → Go server, SQL → Go db)
+just generate
+
+# 4. Apply migrations (one-off; same image is what you'd run as a K8s Job)
+just migrate-up
+
+# 5. Build and run
+just run
+```
+
+Or run the whole stack in containers:
 
 ```bash
 docker compose up --build
 ```
 
-## Development
+The server listens on `http://localhost:8080` by default.
 
-### Prerequisites
+## Recipes
 
-- Go 1.22+
-- Node.js 20+ (for TypeSpec)
-- Docker & Docker Compose
-- [schemathesis](https://github.com/schemathesis/schemathesis) (for fuzz testing)
+Task runner is [just](https://github.com/casey/just). `.env` is auto-loaded.
 
-### Make Targets
-
-| Target | Description |
+| Recipe | Description |
 |---|---|
-| `make generate` | Run full generation pipeline (TypeSpec + oapi-codegen + sqlc) |
-| `make generate-typespec` | Compile TypeSpec to OpenAPI YAML |
-| `make generate-api` | Generate Go server code from OpenAPI |
-| `make generate-db` | Generate Go database code from SQL |
-| `make build` | Build the API binary |
-| `make run` | Build and run locally |
-| `make test` | Run unit tests |
-| `make lint` | Run golangci-lint |
-| `make fuzz` | Run schemathesis fuzz tests |
-| `make docker-up` | Start all services |
-| `make docker-down` | Stop all services |
+| `just` | List all recipes |
+| `just generate` | Full pipeline: TypeSpec → OpenAPI → Go server, SQL → Go db |
+| `just generate-typespec` | Compile TypeSpec; emits one OpenAPI doc per declared version |
+| `just generate-api [version]` | oapi-codegen against `api/openapi-spec/<version>/openapi.yaml` (default `1.0`) |
+| `just generate-db` | sqlc generate |
+| `just build` | Build `bin/api` |
+| `just run` | Build and run locally (needs `DATABASE_URL`) |
+| `just test` | Unit + integration tests |
+| `just test-unit` | Unit tests only (`go test -short ./...`) |
+| `just test-integration` | Integration tests (dockertest spins up Postgres) |
+| `just lint` | golangci-lint in Docker |
+| `just fuzz [version]` | Run schemathesis against a running server (default `1.0`) |
+| `just seed` | Apply `db/seeds/pets.sql` to the running Compose Postgres |
+| `just migrate-up` / `migrate-down` | Apply / roll back migrations via the `migrate/migrate` CLI image |
+| `just docker-up` / `docker-down` | Start/stop the full Compose stack |
+| `just clean` | Remove `bin/`, `node_modules/`, and the generated `api/openapi-spec/` |
 
-### Project Structure
+All recipes run their external tools in Docker — no host toolchain beyond `docker`, `go`, and `just` is required for the dev loop.
 
-```
-typespec/           TypeSpec API definition
-api/                Generated OpenAPI spec
-internal/api/       Generated Go server code (oapi-codegen)
-internal/db/        Generated Go database code (sqlc)
-internal/server/    Handler implementation
-internal/config/    Configuration loading
-internal/migrate/   Database migration runner
-cmd/api/            Application entrypoint
-db/migrations/      SQL migration files
-db/queries/         SQL queries for sqlc
-```
+The version argument on `generate-api` and `fuzz` selects which generated OpenAPI document is consumed.
 
-### Workflow
+## Configuration
 
-1. Edit `typespec/main.tsp` to change the API contract
-2. Edit `db/queries/pets.sql` to change database queries
-3. Run `make generate` to regenerate all code
-4. Implement/update handlers in `internal/server/server.go`
-5. Run `make test` and `make fuzz` to verify
+| Env var | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | *(required)* | Postgres connection string (`postgres://…`) |
+| `PORT` | `8080` | HTTP listen port |
+| `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
-## API Endpoints
+## Workflow for adding an endpoint or field
+
+1. **Contract.** Edit `api/typespec/{routes,models}.tsp`. Annotate with `@added(Versions.vX)` if the change should only apply to a new version.
+2. **Schema.** If new state needs to be persisted, add a migration in `db/migrations/` and a query in `db/queries/`.
+3. **Generate.** `just generate` regenerates OpenAPI, Go server types, and Go db code.
+4. **Implement.** Add the handler method to `internal/server/server.go` — the project will not compile until you do (the `StrictServerInterface` enforces it).
+5. **Verify.** `just test` for behavior, `just fuzz` for contract conformance, `just lint` for style.
+
+## API endpoints
+
+Endpoints available in **v1.0** and **v2.0**:
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/health` | Health check |
-| GET | `/pets` | List pets (with `limit` and `offset`) |
-| POST | `/pets` | Create a pet |
-| GET | `/pets/{petId}` | Get a pet by ID |
-| PUT | `/pets/{petId}` | Update a pet |
-| DELETE | `/pets/{petId}` | Delete a pet |
+| `GET` | `/health` | Health check (pings the DB pool) |
+| `GET` | `/pets?limit=&cursor=` | List pets, cursor-paginated |
+| `POST` | `/pets` | Create a pet |
+| `GET` | `/pets/{petId}` | Get a pet by id |
+| `PUT` | `/pets/{petId}` | Patch-style partial update |
+| `DELETE` | `/pets/{petId}` | Delete a pet |
+
+Added in **v2.0**:
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/pets/{petId}/tags` | List tags for a pet |
+
+The `Pet`, `NewPet`, and `UpdatePet` models also gain a `tags: string[]` field in v2.0.
+
+## Testing
+
+- **Unit tests** live alongside the code (`*_test.go`).
+- **Integration tests** spin up an ephemeral Postgres via [dockertest](https://github.com/ory/dockertest), apply migrations, and run against a real database. See `internal/testutil/testdb.go`.
+- **Contract fuzzing** uses schemathesis. It reads the OpenAPI document and generates randomised requests, asserting that responses conform to the declared schema and that no 500s are returned. Run against any version with `just fuzz <version>`.
+
+## Prerequisites
+
+- Docker (everything else runs in containers)
+- [just](https://github.com/casey/just) (`brew install just`)
+- Go 1.26+ (only needed for `just build` / `just run` outside Docker)
 
 ## License
 

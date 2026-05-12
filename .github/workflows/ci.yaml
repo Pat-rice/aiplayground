@@ -21,21 +21,23 @@ jobs:
         with:
           node-version: "20"
 
+      - uses: extractions/setup-just@v2
+
       - name: Generate code
-        run: make generate
+        run: just generate
 
       - name: Check generated code is up to date
         run: |
-          git diff --exit-code || (echo "Generated code is out of date. Run 'make generate' and commit." && exit 1)
+          git diff --exit-code || (echo "Generated code is out of date. Run 'just generate' and commit." && exit 1)
 
       - name: Build
-        run: make build
+        run: just build
 
       - name: Unit tests
-        run: make test-unit
+        run: just test-unit
 
       - name: Integration tests (dockertest + PostgreSQL)
-        run: make test-integration
+        run: just test-integration
 
   fuzz:
     runs-on: ubuntu-latest
@@ -51,7 +53,7 @@ jobs:
         run: pip install schemathesis
 
       - name: Run schemathesis fuzz tests
-        run: schemathesis run api/openapi-spec/v2/openapi.yaml --base-url http://localhost:8080 --checks all --wait-for-schema 30
+        run: schemathesis run api/openapi-spec/2.0/openapi.yaml --base-url http://localhost:8080 --checks all --wait-for-schema 30
 
       - name: Stop services
         if: always()
